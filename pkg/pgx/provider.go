@@ -4,6 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -12,11 +18,9 @@ import (
 	"github.com/jcmturner/gokrb5/v8/credentials"
 	"github.com/jcmturner/gokrb5/v8/gssapi"
 	"github.com/jcmturner/gokrb5/v8/spnego"
-	"net"
-	"os"
-	"strings"
-	"time"
 )
+
+var gssProviderMu sync.Mutex
 
 // ---- GSS провайдер, построенный на gokrb5 + ccache ----
 
@@ -93,6 +97,14 @@ func QueryAsUser(ctx context.Context, dsn string, ccachePath string, krb5Conf st
 	// Регистрируем фабрику GSS, возвращающую провайдер из нужного ccache.
 	// Это глобальная регистрация в pgconn, поэтому создание соединения MUST быть
 	// синхронизировано, если у вас параллелизм. Проще — не использовать пул.
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	// (опционально) указать TLS, таймауты, Dialer и т.п.
+	cfg.ConnectTimeout = 5 * time.Second
+	cfg.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: os.Getenv("PG_HOST")}
+	gssProviderMu.Lock()
 	pgconn.RegisterGSSProvider(func() (pgconn.GSS, error) {
 		return NewGSSFromCCache(ccachePath, krb5Conf,
 			// полезные тюнинги клиента:
@@ -101,15 +113,8 @@ func QueryAsUser(ctx context.Context, dsn string, ccachePath string, krb5Conf st
 		)
 	})
 
-	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		return nil, err
-	}
-	// (опционально) указать TLS, таймауты, Dialer и т.п.
-	cfg.ConnectTimeout = 5 * time.Second
-	cfg.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: os.Getenv("PG_HOST")}
-
 	conn, err := pgx.ConnectConfig(ctx, cfg)
+	gssProviderMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -138,9 +143,6 @@ func QueryAsUser(ctx context.Context, dsn string, ccachePath string, krb5Conf st
 //
 // Постоянный общий пул НЕподходит для E2E SSO — там смешаются пользователи.
 func PoolForUser(ctx context.Context, dsn, ccachePath, krb5Conf string) (*pgxpool.Pool, error) {
-	pgconn.RegisterGSSProvider(func() (pgconn.GSS, error) {
-		return NewGSSFromCCache(ccachePath, krb5Conf)
-	})
 	pc, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
@@ -153,5 +155,11 @@ func PoolForUser(ctx context.Context, dsn, ccachePath, krb5Conf string) (*pgxpoo
 		d := net.Dialer{Timeout: 5 * time.Second}
 		return d.DialContext(ctx, network, addr)
 	}
-	return pgxpool.NewWithConfig(ctx, pc)
+	gssProviderMu.Lock()
+	pgconn.RegisterGSSProvider(func() (pgconn.GSS, error) {
+		return NewGSSFromCCache(ccachePath, krb5Conf)
+	})
+	pool, err := pgxpool.NewWithConfig(ctx, pc)
+	gssProviderMu.Unlock()
+	return pool, err
 }

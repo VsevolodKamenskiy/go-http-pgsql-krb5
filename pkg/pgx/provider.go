@@ -13,6 +13,7 @@ import (
 	"github.com/jcmturner/gokrb5/v8/gssapi"
 	"github.com/jcmturner/gokrb5/v8/spnego"
 	"net"
+	"os"
 	"strings"
 	"time"
 )
@@ -106,7 +107,7 @@ func QueryAsUser(ctx context.Context, dsn string, ccachePath string, krb5Conf st
 	}
 	// (опционально) указать TLS, таймауты, Dialer и т.п.
 	cfg.ConnectTimeout = 5 * time.Second
-	cfg.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}
+	cfg.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: os.Getenv("PG_HOST")}
 
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
